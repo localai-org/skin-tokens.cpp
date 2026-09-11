@@ -1,0 +1,213 @@
+From 96e0edd299ca21f5213b0c48de5af2b34f6a8eb1 Mon Sep 17 00:00:00 2001
+From: Ari <aristomenis.kollias@gmail.com>
+Date: Fri, 11 Sep 2026 19:26:44 +0200
+Subject: [PATCH] metal: add DIAG_MASK_INF kernel (causal attention mask)
+
+---
+ src/ggml-metal/ggml-metal-device.cpp | 18 ++++++++++
+ src/ggml-metal/ggml-metal-device.h   |  1 +
+ src/ggml-metal/ggml-metal-device.m   |  2 ++
+ src/ggml-metal/ggml-metal-impl.h     | 20 ++++++++++++
+ src/ggml-metal/ggml-metal-ops.cpp    | 49 ++++++++++++++++++++++++++++
+ src/ggml-metal/ggml-metal-ops.h      |  1 +
+ src/ggml-metal/ggml-metal.metal      | 20 ++++++++++++
+ 7 files changed, 111 insertions(+)
+
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 953c757..233dd74 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -199,6 +199,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag(ggml_metal_
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag_mask_inf(ggml_metal_library_t lib, const ggml_tensor * op) {
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_diag_mask_inf_%s", ggml_type_name(op->src[0]->type));
++    snprintf(name, 256, "%s", base);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    res.nsg  = 1;
++    res.smem = 0;
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat(ggml_metal_library_t lib, ggml_type tsrc) {
+     char base[256];
+     char name[256];
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index 7e1deea..fd183f8 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -114,6 +114,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag              (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag_mask_inf     (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat            (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
+index 312b00d..67f1a96 100644
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -1481,6 +1481,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+             }
+         case GGML_OP_DIAG:
+             return true;
++        case GGML_OP_DIAG_MASK_INF:
++            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_OPT_STEP_ADAMW:
+         case GGML_OP_OPT_STEP_SGD:
+             return has_simdgroup_reduction;
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index 1f6e8c4..5f02d2b 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -1023,6 +1023,26 @@ typedef struct {
+     uint64_t nb3;
+ } ggml_metal_kargs_diag;
+ 
++typedef struct {
++    int32_t  ne00;
++    int32_t  ne01;
++    int32_t  ne02;
++    int32_t  ne03;
++    uint64_t nb00;
++    uint64_t nb01;
++    uint64_t nb02;
++    uint64_t nb03;
++    int32_t  ne0;
++    int32_t  ne1;
++    int32_t  ne2;
++    int32_t  ne3;
++    uint64_t nb0;
++    uint64_t nb1;
++    uint64_t nb2;
++    uint64_t nb3;
++    int32_t  n_past;
++} ggml_metal_kargs_diag_mask_inf;
++
+ typedef struct {
+     int64_t  ne00;
+     int64_t  ne01;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index b7f9b2d..cc2f56c 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -375,6 +375,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_diag(ctx, idx);
+             } break;
++        case GGML_OP_DIAG_MASK_INF:
++            {
++                n_fuse = ggml_metal_op_diag_mask_inf(ctx, idx);
++            } break;
+         case GGML_OP_L2_NORM:
+             {
+                 n_fuse = ggml_metal_op_l2_norm(ctx, idx);
+@@ -1311,6 +1315,51 @@ int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_diag_mask_inf(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_TENSOR_LOCALS(int32_t,  ne0, op->src[0], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
++    GGML_TENSOR_LOCALS(int32_t,  ne, op, ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb, op, nb);
++
++    const int32_t n_past = ((const int32_t *) op->op_params)[0];
++
++    ggml_metal_kargs_diag_mask_inf args = {
++        /*.ne00 =*/ne00,
++        /*.ne01 =*/ne01,
++        /*.ne02 =*/ne02,
++        /*.ne03 =*/ne03,
++        /*.nb00 =*/nb00,
++        /*.nb01 =*/nb01,
++        /*.nb02 =*/nb02,
++        /*.nb03 =*/nb03,
++        /*.ne0  =*/ne0,
++        /*.ne1  =*/ne1,
++        /*.ne2  =*/ne2,
++        /*.ne3  =*/ne3,
++        /*.nb0  =*/nb0,
++        /*.nb1  =*/nb1,
++        /*.nb2  =*/nb2,
++        /*.nb3  =*/nb3,
++        /*.n_past =*/n_past,
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_diag_mask_inf(lib, op);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         2);
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, 32, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/src/ggml-metal/ggml-metal-ops.h b/src/ggml-metal/ggml-metal-ops.h
+index b03b59e..06a8feb 100644
+--- a/src/ggml-metal/ggml-metal-ops.h
++++ b/src/ggml-metal/ggml-metal-ops.h
+@@ -54,6 +54,7 @@ int ggml_metal_op_cumsum            (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_get_rows          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_set_rows          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_diag              (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_diag_mask_inf     (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_dsv4_hc           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
+diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
+index 243c997..4a13bba 100644
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -10243,6 +10243,26 @@ kernel void kernel_diag_f32(
+     }
+ }
+ 
++kernel void kernel_diag_mask_inf_f32(
++        constant ggml_metal_kargs_diag_mask_inf & args,
++        device   const char * src0,
++        device         char * dst,
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]]) {
++    constexpr short NW = N_SIMDWIDTH;
++
++    const int32_t i3 = tgpig.z;
++    const int32_t i2 = tgpig.y;
++    const int32_t i1 = tgpig.x;
++
++    device const float * src0_ptr = (device const float *)(src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
++    device       float * dst_ptr  = (device       float *)(dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3);
++
++    for (int i0 = tiitg; i0 < args.ne00; i0 += NW) {
++        dst_ptr[i0] = (i0 > args.n_past + i1) ? -INFINITY : src0_ptr[i0];
++    }
++}
++
+ constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
+ constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
+ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
+-- 
+2.34.1
+

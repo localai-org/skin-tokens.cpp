@@ -11,6 +11,9 @@ Current base: `8c63e70982c95ceb862e3a1073a2c1beef75d60a` (`v0.20.2`).
   available, allowing `GGML_PREC_F32` graphs to avoid an implicit F16 path.
 - `0002` handles F16 weights with F32 inputs on coopmat2 without selecting the
   unavailable F16-by-F32 pipeline.
+- `0003` adds a Metal kernel for `GGML_OP_DIAG_MASK_INF` (the causal attention
+  mask used by the TokenRig Qwen graph), which upstream's Metal backend no longer
+  ships. Without it `--device auto` aborts on Apple GPUs with `unsupported op`.
 
 CMake copies the pristine submodule into the active build directory and applies
 these patches there during configuration. It never modifies `ggml/`. Patch
