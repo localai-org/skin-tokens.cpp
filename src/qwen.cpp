@@ -89,6 +89,22 @@ ggml_tensor * rms(ggml_context * context, ggml_tensor * input, ggml_tensor * wei
     return ggml_mul(context, normalized, ggml_repeat(context, weight, normalized));
 }
 
+// The causal mask is data rather than GGML_OP_DIAG_MASK_INF, which has no Metal
+// kernel. ggml_soft_max_ext adds it to the scaled scores on every backend.
+ggml_tensor * causal_mask(ggml_context * context, std::int64_t sequence) {
+    auto * mask = ggml_new_tensor_2d(context, GGML_TYPE_F32, sequence, sequence);
+    ggml_set_input(mask);
+    return mask;
+}
+
+std::vector<float> causal_mask_values(std::size_t sequence) {
+    std::vector<float> values(sequence * sequence, 0.0F);
+    for (std::size_t row = 0; row < sequence; ++row)
+        for (std::size_t column = row + 1U; column < sequence; ++column)
+            values[row * sequence + column] = -std::numeric_limits<float>::infinity();
+    return values;
+}
+
 ggml_tensor * repeat_kv(ggml_context * context, ggml_tensor * value, std::int64_t sequence) {
     auto * grouped = ggml_reshape_4d(context, value, head_dim, kv_heads, 1, sequence);
     auto * shape = ggml_new_tensor_4d(context, value->type, head_dim, kv_heads, heads / kv_heads, sequence);
@@ -105,7 +121,8 @@ ggml_tensor * repeat_kv_batched(ggml_context * context, ggml_tensor * value,
 }
 
 ggml_tensor * qwen_layer_graph(ggml_context * context, ggml_tensor * input,
-                               ggml_tensor * positions, const weight_component & weights,
+                               ggml_tensor * positions, ggml_tensor * mask,
+                               const weight_component & weights,
                                std::size_t layer, std::int64_t sequence) {
     const std::string prefix = "llm.l." + std::to_string(layer) + ".";
     const auto get = [&](std::string_view suffix) {
@@ -132,10 +149,8 @@ ggml_tensor * qwen_layer_graph(ggml_context * context, ggml_tensor * input,
     v = ggml_permute(context, v, 0, 2, 1, 3);
     auto * scores = ggml_mul_mat(context, k, q);
     ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    scores = ggml_diag_mask_inf(context,
-        ggml_scale(context, scores, 1.0F / std::sqrt(static_cast<float>(head_dim))), 0);
     auto * attended = ggml_mul_mat(context, ggml_cont(context, ggml_transpose(context, v)),
-                                   ggml_soft_max(context, scores));
+                                   ggml_soft_max_ext(context, scores, mask, 1.0F / std::sqrt(static_cast<float>(head_dim)), 0.0F));
     ggml_mul_mat_set_prec(attended, GGML_PREC_F32);
     attended = ggml_cont(context, ggml_permute(context, attended, 0, 2, 1, 3));
     auto * state = ggml_add(context, input, linear(context,
@@ -384,6 +399,7 @@ public:
                                          static_cast<std::int64_t>(mesh_sequence_));
         positions_ = ggml_new_tensor_1d(context_.get(), GGML_TYPE_I32,
                                         static_cast<std::int64_t>(sequence));
+        mask_ = causal_mask(context_.get(), static_cast<std::int64_t>(sequence));
         ggml_set_input(mesh_input_);
         ggml_set_input(positions_);
         ggml_tensor * token_state = nullptr;
@@ -402,7 +418,7 @@ public:
         auto * state = ggml_concat(context_.get(),
             ggml_repeat(context_.get(), mesh_input_, mesh_shape), token_state, 1);
         for (std::size_t layer = 0; layer < 28U; ++layer) {
-            state = qwen_layer_graph(context_.get(), state, positions_, weights, layer,
+            state = qwen_layer_graph(context_.get(), state, positions_, mask_, weights, layer,
                                      static_cast<std::int64_t>(sequence));
         }
         auto * final_norm = rms(context_.get(), state, required(weights, "llm.norm.w"), 1e-6F);
@@ -423,6 +439,7 @@ public:
         position_values_.resize(sequence);
         for (std::size_t index = 0; index < sequence; ++index)
             position_values_[index] = static_cast<std::int32_t>(index);
+        mask_values_ = causal_mask_values(sequence);
         if (active_qwen_profile != nullptr) {
             active_qwen_profile->layers += 28U;
             active_qwen_profile->setup_ms += elapsed_ms(profile_start);
@@ -445,6 +462,7 @@ public:
                                     token_count_ * sizeof(std::int32_t));
         ggml_backend_tensor_set(positions_, position_values_.data(), 0,
                                 position_values_.size() * sizeof(std::int32_t));
+        ggml_backend_tensor_set(mask_, mask_values_.data(), 0, mask_values_.size() * sizeof(float));
         if (active_qwen_profile != nullptr) {
             active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
             active_qwen_profile->host_to_device_bytes += mesh_embeddings.size_bytes() +
@@ -478,9 +496,11 @@ private:
     ggml_tensor * mesh_input_ = nullptr;
     std::vector<ggml_tensor *> token_ids_;
     ggml_tensor * positions_ = nullptr;
+    ggml_tensor * mask_ = nullptr;
     ggml_tensor * logits_ = nullptr;
     ggml_cgraph * graph_ = nullptr;
     std::vector<std::int32_t> position_values_;
+    std::vector<float> mask_values_;
 };
 
 class qwen_graph_cache {
@@ -559,13 +579,14 @@ public:
                                         static_cast<std::int64_t>(tokens.size()));
         auto * positions = ggml_new_tensor_1d(context.get(), GGML_TYPE_I32,
                                               static_cast<std::int64_t>(sequence));
+        auto * mask = causal_mask(context.get(), static_cast<std::int64_t>(sequence));
         ggml_set_input(mesh_input);
         ggml_set_input(ids);
         ggml_set_input(positions);
         auto * state = ggml_concat(context.get(), mesh_input,
             ggml_get_rows(context.get(), required(weights_, "llm.tok.w"), ids), 1);
         for (std::size_t layer = 0; layer < 28U; ++layer)
-            state = prefill_layer(context.get(), state, positions, layer,
+            state = prefill_layer(context.get(), state, positions, mask, layer,
                                   static_cast<std::int64_t>(sequence));
         auto * normalized = rms(context.get(), state, required(weights_, "llm.norm.w"), 1e-6F);
         auto * last = ggml_view_2d(context.get(), normalized, hidden, 1, normalized->nb[1],
@@ -581,6 +602,7 @@ public:
         std::vector<std::int32_t> position_values(sequence);
         for (std::size_t index = 0; index < sequence; ++index)
             position_values[index] = static_cast<std::int32_t>(index);
+        const auto mask_values = causal_mask_values(sequence);
         if (active_qwen_profile != nullptr) {
             active_qwen_profile->setup_ms += elapsed_ms(profile_start);
             active_qwen_profile->layers += 28U;
@@ -590,6 +612,7 @@ public:
         ggml_backend_tensor_set(mesh_input, mesh_embeddings.data(), 0, mesh_embeddings.size_bytes());
         ggml_backend_tensor_set(ids, tokens.data(), 0, tokens.size_bytes());
         ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(std::int32_t));
+        ggml_backend_tensor_set(mask, mask_values.data(), 0, mask_values.size() * sizeof(float));
         if (active_qwen_profile != nullptr) {
             active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
             active_qwen_profile->host_to_device_bytes += mesh_embeddings.size_bytes() +
@@ -741,8 +764,8 @@ private:
     }
 
     ggml_tensor * prefill_layer(ggml_context * context, ggml_tensor * input,
-                                ggml_tensor * positions, std::size_t layer,
-                                std::int64_t sequence) {
+                                ggml_tensor * positions, ggml_tensor * mask,
+                                std::size_t layer, std::int64_t sequence) {
         const std::string prefix = "llm.l." + std::to_string(layer) + ".";
         const auto get = [&](std::string_view suffix) {
             return required(weights_, prefix + std::string{suffix});
@@ -771,10 +794,8 @@ private:
         v = ggml_permute(context, v, 0, 2, 1, 3);
         auto * scores = ggml_mul_mat(context, k, q);
         ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-        scores = ggml_diag_mask_inf(context,
-            ggml_scale(context, scores, 1.0F / std::sqrt(static_cast<float>(head_dim))), 0);
         auto * attended = ggml_mul_mat(context, ggml_cont(context, ggml_transpose(context, v)),
-                                       ggml_soft_max(context, scores));
+                                       ggml_soft_max_ext(context, scores, mask, 1.0F / std::sqrt(static_cast<float>(head_dim)), 0.0F));
         ggml_mul_mat_set_prec(attended, GGML_PREC_F32);
         attended = ggml_cont(context, ggml_permute(context, attended, 0, 2, 1, 3));
         auto * state = ggml_add(context, input, linear(context,
@@ -883,6 +904,7 @@ result<tensor_snapshot> run_qwen_layer0(const weight_component & weights, ggml_b
     const auto seq = static_cast<std::int64_t>(sequence);
     auto * x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, seq);
     auto * positions = ggml_new_tensor_1d(context, GGML_TYPE_I32, seq);
+    auto * mask = causal_mask(context, seq);
     ggml_set_input(x);
     ggml_set_input(positions);
 
@@ -910,8 +932,7 @@ result<tensor_snapshot> run_qwen_layer0(const weight_component & weights, ggml_b
     ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
     scores = ggml_scale(context, scores, 1.0F / std::sqrt(static_cast<float>(head_dim)));
     auto * raw_scores = scores;
-    scores = ggml_diag_mask_inf(context, scores, 0);
-    auto * probabilities = ggml_soft_max(context, scores);
+    auto * probabilities = ggml_soft_max_ext(context, scores, mask, 1.0F, 0.0F);
     v = ggml_cont(context, ggml_transpose(context, v));
     auto * attention = ggml_mul_mat(context, v, probabilities);
     ggml_mul_mat_set_prec(attention, GGML_PREC_F32);
@@ -955,6 +976,8 @@ result<tensor_snapshot> run_qwen_layer0(const weight_component & weights, ggml_b
         position_values[index] = static_cast<std::int32_t>(index);
     ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
     ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(std::int32_t));
+    const auto mask_values = causal_mask_values(sequence);
+    ggml_backend_tensor_set(mask, mask_values.data(), 0, mask_values.size() * sizeof(float));
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
         return std::unexpected(fail(error_code::compute, "Qwen layer graph execution failed"));
     tensor_snapshot output;
@@ -979,6 +1002,7 @@ result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml
     auto get = [&](std::string_view suffix) { return required(weights, prefix + std::string{suffix}); };
     auto * x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, seq);
     auto * positions = ggml_new_tensor_1d(context, GGML_TYPE_I32, seq);
+    auto * mask = causal_mask(context, seq);
     ggml_set_input(x); ggml_set_input(positions);
     auto * normalized = rms(context, x, get("an.w"), 1e-6F);
     auto * q = ggml_reshape_3d(context, linear(context, normalized, get("attn.q.w")), head_dim, heads, seq);
@@ -996,10 +1020,8 @@ result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml
     v = ggml_permute(context, v, 0, 2, 1, 3);
     auto * scores = ggml_mul_mat(context, k, q);
     ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    scores = ggml_diag_mask_inf(context,
-        ggml_scale(context, scores, 1.0F / std::sqrt(static_cast<float>(head_dim))), 0);
     auto * attended = ggml_mul_mat(context, ggml_cont(context, ggml_transpose(context, v)),
-                                   ggml_soft_max(context, scores));
+                                   ggml_soft_max_ext(context, scores, mask, 1.0F / std::sqrt(static_cast<float>(head_dim)), 0.0F));
     ggml_mul_mat_set_prec(attended, GGML_PREC_F32);
     attended = ggml_cont(context, ggml_permute(context, attended, 0, 2, 1, 3));
     auto * state = ggml_add(context, x, linear(context,
@@ -1019,6 +1041,7 @@ result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml
     auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
     std::vector<std::int32_t> position_values(sequence);
     for (std::size_t index = 0; index < sequence; ++index) position_values[index] = static_cast<std::int32_t>(index);
+    const auto mask_values = causal_mask_values(sequence);
     if (active_qwen_profile != nullptr) {
         active_qwen_profile->setup_ms += elapsed_ms(profile_start);
         ++active_qwen_profile->layers;
@@ -1026,6 +1049,7 @@ result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml
     auto phase_start = profile_clock::now();
     ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
     ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(std::int32_t));
+    ggml_backend_tensor_set(mask, mask_values.data(), 0, mask_values.size() * sizeof(float));
     if (active_qwen_profile != nullptr) {
         active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
         active_qwen_profile->host_to_device_bytes += input.size_bytes() + position_values.size() * sizeof(std::int32_t);
