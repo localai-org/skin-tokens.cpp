@@ -9,6 +9,9 @@
 #include <numeric>
 #include <random>
 #include <span>
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+#endif
 
 namespace skintokens {
 
@@ -421,13 +424,38 @@ public:
 private:
 #if defined(__SIZEOF_INT128__)
     __extension__ using uint128 = unsigned __int128;
-#else
-#error "The NumPy-compatible PCG64 inference sampler requires 128-bit integer support"
-#endif
-
     static constexpr uint128 make128(std::uint64_t high, std::uint64_t low) {
         return (static_cast<uint128>(high) << 64U) | static_cast<uint128>(low);
     }
+#elif defined(_MSC_VER) && defined(_M_X64)
+    // MSVC has no __int128; the sampler only needs mod-2^128 multiply, add,
+    // and the high/low word split, which _umul128 supplies.
+    struct uint128 {
+        constexpr uint128() = default;
+        constexpr uint128(std::uint64_t low) : lo(low) {}
+        constexpr uint128(std::uint64_t high, std::uint64_t low) : lo(low), hi(high) {}
+        constexpr uint128 operator+(const uint128 & other) const {
+            const std::uint64_t l = lo + other.lo;
+            return uint128(hi + other.hi + (l < lo ? 1U : 0U), l);
+        }
+        uint128 operator*(const uint128 & other) const {
+            std::uint64_t carry = 0;
+            const std::uint64_t l = _umul128(lo, other.lo, &carry);
+            return uint128(hi * other.lo + lo * other.hi + carry, l);
+        }
+        uint128 operator>>(unsigned bits) const {
+            return bits >= 64U ? uint128(0U, hi) : uint128(0U, (hi << (64U - bits)) | (lo >> bits));
+        }
+        explicit operator std::uint64_t() const { return lo; }
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+    };
+    static constexpr uint128 make128(std::uint64_t high, std::uint64_t low) {
+        return uint128(high, low);
+    }
+#else
+#error "The NumPy-compatible PCG64 inference sampler requires 128-bit integer support"
+#endif
 
     std::uint64_t next64() {
         constexpr uint128 multiplier = make128(0x2360ed051fc65da4ULL, 0x4385df649fccf645ULL);
