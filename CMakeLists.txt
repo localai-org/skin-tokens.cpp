@@ -78,6 +78,12 @@ if(SKINTOKENS_DYNAMIC_BACKENDS)
   set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 endif()
 add_subdirectory("${SKINTOKENS_GGML_EFFECTIVE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/ggml" EXCLUDE_FROM_ALL)
+if(TARGET ggml-vulkan)
+  # GGML finds this package in a child scope but does not consume its headers.
+  # Import it here too (using the cached package location) for this link call.
+  find_package(SPIRV-Headers CONFIG REQUIRED)
+  target_link_libraries(ggml-vulkan PRIVATE SPIRV-Headers::SPIRV-Headers)
+endif()
 
 # GGML records its public headers as paths relative to the submodule root.
 # This parent project owns the install rule (the subdirectory is excluded from
